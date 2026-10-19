@@ -5,7 +5,7 @@ use soroban_sdk::{token, Address, Env};
 
 use crate::events::{PrizeClaimed, PrizeRefunded, PrizeSwept, TicketRefunded};
 use crate::{
-    calculate_tier_prize, read_raffle, transition_status, write_raffle, DataKey, Error, Guard,
+    calculate_tier_prize, read_raffle, apply_status_transition, write_raffle, DataKey, Error, Guard,
     RaffleStatus, Winner,
 };
 
@@ -67,7 +67,7 @@ pub(crate) fn claim_prize(env: Env, winner: Address, tier_index: u32) -> Result<
 
     let all_claimed = raffle.winners.iter().all(|entry| entry.claimed);
     if all_claimed {
-        transition_status(
+        apply_status_transition(
             &env,
             &mut raffle,
             RaffleStatus::Claimed,
@@ -182,7 +182,7 @@ pub(crate) fn sweep_unclaimed(
 
     let all_claimed = raffle.winners.iter().all(|entry| entry.claimed);
     if all_claimed {
-        transition_status(&env, &mut raffle, RaffleStatus::Claimed, now)?;
+        apply_status_transition(&env, &mut raffle, RaffleStatus::Claimed, now)?;
     }
     write_raffle(&env, &raffle);
     Ok(swept)

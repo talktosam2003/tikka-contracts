@@ -396,3 +396,113 @@ fn init_rejects_quorum_oracle_equal_to_contract() {
     );
 }
 
+
+// ── #1228 parity: instance init and factory builder agree ───────────────────
+
+/// Table-driven parity test: for each config mutation the instance `init` and
+/// the `RaffleConfigBuilder.build()` (which calls `validate_config`) should
+/// either both succeed or both fail with an equivalent error. This pins the
+/// one-validator guarantee introduced in #1228.
+#[test]
+fn init_and_builder_accept_reject_identically() {
+    use raffle_shared::config_builder::RaffleConfigBuilder;
+
+    struct Case {
+        label: &'static str,
+        /// Apply a mutation to the base config before testing both paths.
+        mutate: fn(&mut RaffleConfig, &Env),
+        /// `true` = both should accept; `false` = both should reject.
+        should_succeed: bool,
+    }
+
+    let cases: &[Case] = &[
+        Case {
+            label: "base config is valid",
+            mutate: |_c, _e| {},
+            should_succeed: true,
+        },
+        Case {
+            label: "prize bp sum != 10000",
+            mutate: |c, e| {
+                c.prizes = soroban_sdk::vec![e, 5_000u32]; // only 5000 bp
+            },
+            should_succeed: false,
+        },
+        Case {
+            label: "prize bp sum == 10000 with two tiers",
+            mutate: |c, e| {
+                c.prizes = soroban_sdk::vec![e, 6_000u32, 4_000u32];
+            },
+            should_succeed: true,
+        },
+        Case {
+            label: "metadata_hash all zeros",
+            mutate: |c, e| {
+                c.metadata_hash = soroban_sdk::BytesN::from_array(e, &[0u8; 32]);
+            },
+            should_succeed: false,
+        },
+        Case {
+            label: "claim_expiry <= claim_lockup",
+            mutate: |c, _e| {
+                c.claim_lockup_seconds = Some(1_000);
+                c.claim_expiry_seconds = Some(1_000);
+            },
+            should_succeed: false,
+        },
+        Case {
+            label: "max_tickets_per_address > max_tickets",
+            mutate: |c, _e| {
+                c.max_tickets_per_address = c.max_tickets + 1;
+            },
+            should_succeed: false,
+        },
+        Case {
+            label: "min_tickets > max_tickets",
+            mutate: |c, _e| {
+                c.min_tickets = c.max_tickets + 1;
+            },
+            should_succeed: false,
+        },
+        Case {
+            label: "protocol_fee_bp > 0 without treasury",
+            mutate: |c, _e| {
+                c.protocol_fee_bp = 100;
+                c.treasury_address = None;
+            },
+            should_succeed: false,
+        },
+    ];
+
+    for case in cases {
+        let (env, contract_id, factory, admin, creator, payment_token) = init_bounds_env();
+        let client = ContractClient::new(&env, &contract_id);
+        let mut config = base_config(&env, &payment_token);
+        (case.mutate)(&mut config, &env);
+
+        // -- Instance path --
+        let instance_result = client.try_init(&factory, &admin, &creator, &config);
+        let instance_ok = instance_result.is_ok();
+
+        // -- Builder path (validate_config) --
+        let builder_result =
+            RaffleConfigBuilder::from_config(&env, config.clone()).build();
+        let builder_ok = builder_result.is_ok();
+
+        assert_eq!(
+            instance_ok, case.should_succeed,
+            "instance init mismatch for '{}': expected {}, got {:?}",
+            case.label, case.should_succeed, instance_result
+        );
+        assert_eq!(
+            builder_ok, case.should_succeed,
+            "builder mismatch for '{}': expected {}, got {:?}",
+            case.label, case.should_succeed, builder_result
+        );
+        assert_eq!(
+            instance_ok, builder_ok,
+            "parity violation for '{}': instance={}, builder={}",
+            case.label, instance_ok, builder_ok
+        );
+    }
+}

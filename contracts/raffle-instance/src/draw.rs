@@ -10,13 +10,8 @@ use crate::events::{
     RandomnessFallbackTriggered, RandomnessReceived, RandomnessRequested,
 };
 use crate::helpers::{
-    build_internal_seed_u64, do_finalize_with_seed, read_raffle, request_randomness,
-    require_awaiting_randomness, revert_status, transition_status, transition_to_drawing,
-};
-use crate::randomness::{build_vrf_proof_message, derive_random_seed_from_proof};
-use crate::{
-    CommitRevealEntry, DataKey, Error, RaffleStatus, ORACLE_TIMEOUT_LEDGERS,
-    RANDOMNESS_MIN_DELAY_LEDGERS,
+    apply_status_revert, apply_status_transition, build_internal_seed_u64, do_finalize_with_seed,
+    read_raffle, request_randomness, require_awaiting_randomness, transition_to_drawing, write_raffle,
 };
 use crate::randomness::{build_vrf_proof_message, derive_random_seed_from_proof};
 use crate::{
@@ -75,7 +70,8 @@ pub(crate) fn finalize_raffle(env: Env) -> Result<(), Error> {
         } else {
             FailureReason::MinTicketsNotMet
         };
-        transition_status(&env, &mut raffle, RaffleStatus::Failed, now)?;
+        apply_status_transition(&env, &mut raffle, RaffleStatus::Failed, now)?;
+        write_raffle(&env, &raffle);
         RaffleFailed {
             creator: raffle.creator.clone(),
             reason: failure_reason,
@@ -130,7 +126,8 @@ pub(crate) fn finalize_raffle(env: Env) -> Result<(), Error> {
             }
             Err(err) => {
                 if !already_drawing {
-                    revert_status(&env, &mut raffle, pre_status)?;
+                    apply_status_revert(&env, &mut raffle, pre_status)?;
+                    write_raffle(&env, &raffle);
                 }
                 env.storage()
                     .instance()
@@ -163,7 +160,8 @@ pub(crate) fn finalize_raffle(env: Env) -> Result<(), Error> {
             }
             Err(err) => {
                 if !already_drawing {
-                    revert_status(&env, &mut raffle, pre_status)?;
+                    apply_status_revert(&env, &mut raffle, pre_status)?;
+                    write_raffle(&env, &raffle);
                 }
                 env.storage()
                     .instance()
@@ -368,12 +366,13 @@ pub(crate) fn trigger_randomness_fallback(
     }
 
     if do_cancel {
-        transition_status(
+        apply_status_transition(
             &env,
             &mut raffle,
             RaffleStatus::Cancelled,
             env.ledger().timestamp(),
         )?;
+        write_raffle(&env, &raffle);
         env.storage()
             .instance()
             .remove(&DataKey::RandomnessRequested);

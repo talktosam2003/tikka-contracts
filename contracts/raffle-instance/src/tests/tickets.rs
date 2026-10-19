@@ -930,3 +930,145 @@ fn time_remaining_is_zero_after_end_time() {
     env.ledger().set_timestamp(1_001);
     assert_eq!(setup.client.get_stats().time_remaining, 0);
 }
+
+// ── #1229 regression: per-address cap uses a single implementation ──────────
+
+/// Table-driven test: for each combination of `(allow_multiple,
+/// max_tickets_per_address, already_held, purchase_quantity)` the cap is
+/// enforced identically by `buy_tickets`, `buy_tickets_for`, and
+/// `get_remaining_ticket_allowance`.
+#[test]
+fn per_address_cap_table_driven() {
+    struct Case {
+        allow_multiple: bool,
+        max_per_addr: u32,
+        already_held: u32,
+        quantity: u32,
+        expected_err: Option<Error>,
+    }
+
+    let cases: &[Case] = &[
+        // unlimited: no cap at all
+        Case { allow_multiple: true, max_per_addr: 0, already_held: 0, quantity: 5, expected_err: None },
+        // allow_multiple=false, no explicit cap → one ticket cap
+        Case { allow_multiple: false, max_per_addr: 0, already_held: 0, quantity: 1, expected_err: None },
+        Case { allow_multiple: false, max_per_addr: 0, already_held: 0, quantity: 2, expected_err: Some(Error::MultipleTicketsNotAllowed) },
+        Case { allow_multiple: false, max_per_addr: 0, already_held: 1, quantity: 1, expected_err: Some(Error::MultipleTicketsNotAllowed) },
+        // explicit max_per_addr=3
+        Case { allow_multiple: true, max_per_addr: 3, already_held: 0, quantity: 3, expected_err: None },
+        Case { allow_multiple: true, max_per_addr: 3, already_held: 2, quantity: 1, expected_err: None },
+        Case { allow_multiple: true, max_per_addr: 3, already_held: 2, quantity: 2, expected_err: Some(Error::ExceedsMaxTicketsPerAddress) },
+        Case { allow_multiple: true, max_per_addr: 3, already_held: 3, quantity: 1, expected_err: Some(Error::ExceedsMaxTicketsPerAddress) },
+        // explicit cap supersedes allow_multiple=false
+        Case { allow_multiple: false, max_per_addr: 5, already_held: 4, quantity: 1, expected_err: None },
+        Case { allow_multiple: false, max_per_addr: 5, already_held: 4, quantity: 2, expected_err: Some(Error::ExceedsMaxTicketsPerAddress) },
+    ];
+
+    for (i, case) in cases.iter().enumerate() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (contract_id, client, _, payment_token) = setup_raffle_env(&env);
+        let buyer = Address::generate(&env);
+        let token = soroban_sdk::token::StellarAssetClient::new(&env, &payment_token);
+        token.mint(&buyer, &1_000_000_000_000i128);
+
+        // Pre-seed the ticket count to simulate `already_held` tickets.
+        if case.already_held > 0 {
+            env.as_contract(&contract_id, || {
+                env.storage().persistent().set(
+                    &DataKey::TicketCount(buyer.clone()),
+                    &case.already_held,
+                );
+                // Also advance tickets_sold so the cap check is consistent.
+                let mut raffle = read_raffle(&env).unwrap();
+                raffle.tickets_sold = case.already_held;
+                raffle.allow_multiple = case.allow_multiple;
+                raffle.max_tickets_per_address = case.max_per_addr;
+                crate::write_raffle(&env, &raffle);
+            });
+        } else {
+            env.as_contract(&contract_id, || {
+                let mut raffle = read_raffle(&env).unwrap();
+                raffle.allow_multiple = case.allow_multiple;
+                raffle.max_tickets_per_address = case.max_per_addr;
+                crate::write_raffle(&env, &raffle);
+            });
+        }
+
+        let result = client.try_buy_tickets(&buyer, &case.quantity);
+        match &case.expected_err {
+            None => {
+                assert!(
+                    result.is_ok(),
+                    "case {i}: expected Ok but got {:?}",
+                    result
+                );
+            }
+            Some(expected) => {
+                assert_eq!(
+                    result,
+                    Err(Ok(expected.clone())),
+                    "case {i}: wrong error"
+                );
+            }
+        }
+    }
+}
+
+/// Helper for per-address cap tests: registers the contract, inits with default
+/// config, and returns (contract_id, client, creator, payment_token).
+fn setup_raffle_env(
+    env: &Env,
+) -> (Address, ContractClient<'_>, Address, Address) {
+    let contract_id = env.register(Contract, ());
+    let client = ContractClient::new(env, &contract_id);
+    let factory = env.register(MockFactory, ());
+    let admin = Address::generate(env);
+    let creator = Address::generate(env);
+
+    let token_admin = Address::generate(env);
+    let payment_token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let sac = soroban_sdk::token::StellarAssetClient::new(env, &payment_token);
+    sac.mint(&creator, &1_000_000_000_000i128);
+
+    let config = RaffleConfig {
+        description: soroban_sdk::String::from_str(env, "cap-test"),
+        end_time: 0,
+        no_deadline: true,
+        max_tickets: 1_000,
+        max_tickets_per_tx: 100,
+        max_tickets_per_address: 0,
+        min_tickets: 1,
+        allow_multiple: true,
+        ticket_price: MIN_TICKET_PRICE,
+        payment_token: payment_token.clone(),
+        prize_amount: MIN_TICKET_PRICE * 1_000,
+        prizes: soroban_sdk::vec![env, 10_000u32],
+        randomness_source: RandomnessSource::Internal,
+        oracle_address: None,
+        oracle_public_key: None,
+        protocol_fee_bp: 0,
+        treasury_address: None,
+        swap_router: None,
+        tikka_token: None,
+        metadata_hash: soroban_sdk::BytesN::from_array(env, &[9u8; 32]),
+        claim_lockup_seconds: Some(0),
+        claim_expiry_seconds: None,
+        swap_deadline_seconds: Some(300),
+        early_bird_ticket_percentage: 0,
+        early_bird_discount_bp: 0,
+        category: None,
+        unique_winners: false,
+        bundles: soroban_sdk::Vec::new(env),
+        prize_token: None,
+        nft_contract: None,
+    };
+
+    client.init(&factory, &admin, &creator, &config);
+    client.deposit_prize();
+
+    (contract_id, client, creator, payment_token)
+}

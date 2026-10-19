@@ -50,7 +50,7 @@ Sources of truth:
 | 43   | `NotInitialized`              | Contract has not been initialized                                 | "Contract not initialized"                               |
 | 44   | `Reentrancy`                  | Reentrant call detected                                           | "Please try again later"                                 |
 | 45   | `TokenTransferFailed`         | Token transfer failed                                             | "Token transfer failed"                                  |
-| 46   | `NoActiveTickets`             | No active tickets available                                       | "No active tickets available"                            |
+| 46   | `NoActiveTickets`             | **[DEPRECATED — reserved, do not handle]** Code 46 was previously documented as reachable from `do_finalize_with_seed` but was an unreachable duplicate of code 33. The discriminant is reserved and will never be reused. Integrators should remove any handling for this code. | "No active tickets available"                            |
 | 47   | `DeadlinePassed`              | Swap deadline has passed                                          | "Swap deadline has passed"                               |
 | 48   | `SlippageExceeded`            | Slippage tolerance exceeded                                       | "Slippage tolerance exceeded"                            |
 | 49   | `InvalidIndex`                | Invalid index provided                                            | "Invalid index provided"                                 |

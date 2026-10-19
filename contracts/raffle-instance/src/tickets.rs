@@ -165,6 +165,8 @@ pub(crate) fn buy_tickets(env: Env, buyer: Address, quantity: u32) -> Result<u32
     validate_purchase_preconditions(&env, &raffle, quantity)?;
 
     let snapshot_sold = raffle.tickets_sold;
+    // Read current count before enforcing — used for the concurrent-modification
+    // check and the buyer-list first-purchase tracking below.
     let current_count: u32 = env
         .storage()
         .persistent()
@@ -178,20 +180,7 @@ pub(crate) fn buy_tickets(env: Env, buyer: Address, quantity: u32) -> Result<u32
     {
         return Err(Error::TicketsSoldOut);
     }
-    if raffle.max_tickets_per_address == 0
-        && !raffle.allow_multiple
-        && (current_count > 0 || quantity > 1)
-    {
-        return Err(Error::MultipleTicketsNotAllowed);
-    }
-    if raffle.max_tickets_per_address > 0
-        && current_count
-            .checked_add(quantity)
-            .ok_or(Error::ArithmeticOverflow)?
-            > raffle.max_tickets_per_address
-    {
-        return Err(Error::ExceedsMaxTicketsPerAddress);
-    }
+    crate::enforce_max_tickets_per_address(&env, &raffle, &buyer, quantity)?;
 
     let timestamp = env.ledger().timestamp();
     let quote = calculate_buy_quote(&raffle, quantity)?;
@@ -441,34 +430,9 @@ pub(crate) fn buy_tickets_for(env: Env, buyer: Address, recipient: Address, quan
     {
         return Err(Error::TicketsSoldOut);
     }
-    if raffle.max_tickets_per_address == 0
-        && !raffle.allow_multiple
-        && (current_count > 0 || quantity > 1)
-    {
-        return Err(Error::MultipleTicketsNotAllowed);
-    }
-    if raffle.max_tickets_per_address > 0
-        && current_count
-            .checked_add(quantity)
-            .ok_or(Error::ArithmeticOverflow)?
-            > raffle.max_tickets_per_address
-    {
-        return Err(Error::ExceedsMaxTicketsPerAddress);
-    }
+    crate::enforce_max_tickets_per_address(&env, &raffle, &recipient, quantity)?;
 
     let timestamp = env.ledger().timestamp();
-        fix/security-checks-effects-763
-    let ticket_total = raffle
-        .ticket_price
-        .checked_mul(quantity as i128)
-        .ok_or(Error::ArithmeticOverflow)?;
-    let protocol_fee = apply_bp(ticket_total, raffle.protocol_fee_bp)
-        .ok_or(Error::ArithmeticOverflow)?;
-
-    let total_price = ticket_total
-        .checked_add(protocol_fee)
-        .ok_or(Error::ArithmeticOverflow)?;
-        master
     let quote = calculate_buy_quote(&raffle, quantity)?;
     let total_price = quote.net_to_pay;
     let protocol_fee = quote.fee;

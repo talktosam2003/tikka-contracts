@@ -309,3 +309,41 @@ fn batch_refund_oversized_batch_rejected() {
     let result = client.try_batch_refund_tickets(&buyer, &ticket_ids);
     assert_eq!(result, Err(Ok(Error::InvalidParameters)));
 }
+
+/// Regression for #1225: `do_finalize_with_seed` must perform exactly one
+/// instance-entry write per call after the refactor that removed the write
+/// from inside `apply_status_transition`.
+///
+/// We cannot directly count storage writes from the test harness, so we
+/// verify the CPU cost of `finalize_raffle` is *at most* the recorded
+/// `FINALIZE_MAX_PRIZES` baseline (i.e. it did not regress due to an
+/// accidental double-write re-appearing). A budget exceeding the baseline
+/// would be a clear signal that more than one raffle write is occurring.
+#[test]
+fn finalize_single_write_within_prior_baseline() {
+    let env = Env::default();
+    env.cost_estimate().budget().reset_unlimited();
+    env.mock_all_auths();
+
+    const FINALIZE_TICKETS: u32 = 1_000;
+    let (client, contract_id, buyer) =
+        setup_raffle(&env, FINALIZE_TICKETS, 1_000, MAX_PRIZES);
+    client.buy_tickets(&buyer, &FINALIZE_TICKETS);
+
+    let snap = measure(&env, || {
+        client.finalize_raffle();
+    });
+
+    // Assert the cost sits within the baseline envelope; a double-write would
+    // push it meaningfully over the prior FINALIZE_MAX_PRIZES ceiling.
+    assert_within_tolerance(
+        "finalize_single_write (#1225 regression)",
+        snap,
+        FINALIZE_MAX_PRIZES,
+    );
+
+    env.as_contract(&contract_id, || {
+        let raffle = read_raffle(&env).unwrap();
+        assert_eq!(raffle.status, RaffleStatus::Finalized);
+    });
+}

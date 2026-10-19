@@ -30,8 +30,8 @@ mod tickets;
 mod views;
 
 pub(crate) use helpers::{
-    calculate_tier_prize, read_raffle, require_admin, require_global_not_paused,
-    transition_status, validate_token_address, write_raffle, Guard,
+    apply_status_transition, apply_status_revert, calculate_tier_prize, read_raffle,
+    require_admin, require_global_not_paused, validate_token_address, write_raffle, Guard,
 };
 #[cfg(any(test, feature = "testutils"))]
 pub use helpers::assert_solvent;
@@ -44,19 +44,30 @@ fn assert_solvent_after_success<T>(env: &Env, result: &Result<T, Error>) {
 }
 
 use raffle_shared::{
+    config_builder::{validate_config, ConfigValidationError},
     constants::{
         DEFAULT_CLAIM_EXPIRY_SECONDS, DEFAULT_CLAIM_LOCKUP_SECONDS, DEFAULT_SWAP_DEADLINE_SECONDS,
-        EMERGENCY_WITHDRAW_DELAY_SECONDS, MAX_CLAIM_LOCKUP_SECONDS, MAX_DESCRIPTION_LENGTH,
-        MAX_PRIZES, MAX_PRIZE_AMOUNT, MAX_PROTOCOL_FEE_BP,
-        MAX_SWAP_DEADLINE_SECONDS, MAX_TICKETS_LIMIT, MIN_CLAIM_EXPIRY_SECONDS, MIN_TICKET_PRICE,
-        ORACLE_TIMEOUT_LEDGERS, RANDOMNESS_MIN_DELAY_LEDGERS,
     },
     exceeds_internal_randomness_cap, BuyQuote, CancelReason, FairnessData, QuorumConfig,
     RaffleConfig, RaffleStats, RaffleStatus, RandomnessSource, RandomnessType, Ticket,
 };
 
-use self::randomness::{
-    build_vrf_proof_message, OracleSeedWinnerSelection, WinnerSelectionStrategy,
+// Re-export constants needed by draw.rs and admin.rs via `crate::`.
+pub(crate) const ORACLE_TIMEOUT_LEDGERS: u32 =
+    raffle_shared::constants::ORACLE_TIMEOUT_LEDGERS;
+pub(crate) const RANDOMNESS_MIN_DELAY_LEDGERS: u32 =
+    raffle_shared::constants::RANDOMNESS_MIN_DELAY_LEDGERS;
+pub(crate) const EMERGENCY_WITHDRAW_DELAY_SECONDS: u64 =
+    raffle_shared::constants::EMERGENCY_WITHDRAW_DELAY_SECONDS;
+pub(crate) const MAX_PROTOCOL_FEE_BP: u32 =
+    raffle_shared::constants::MAX_PROTOCOL_FEE_BP;
+pub(crate) const MAX_SWAP_DEADLINE_SECONDS: u64 =
+    raffle_shared::constants::MAX_SWAP_DEADLINE_SECONDS;
+// Exposed for tests via `use crate::MIN_TICKET_PRICE`.
+pub use raffle_shared::constants::MIN_TICKET_PRICE;
+// These constants are used by test submodules via `use crate::*` / `use super::*`.
+pub use raffle_shared::constants::{
+    MAX_CLAIM_LOCKUP_SECONDS, MIN_CLAIM_EXPIRY_SECONDS,
 };
 
 use crate::events::{
@@ -68,8 +79,6 @@ use crate::events::{
     TicketPurchased, TicketRefunded, TicketSalesPaused, TicketSalesResumed, TokensRescued,
     WinnerDrawn,
 };
-
-const RANDOMNESS_MIN_DELAY_LEDGERS: u32 = 10;
 
 #[contract]
 pub struct RaffleInstance;
@@ -280,7 +289,7 @@ pub enum Error {
     NotInitialized = 43,
     Reentrancy = 44,
     TokenTransferFailed = 45,
-    NoActiveTickets = 46,
+    NoActiveTickets = 46, // DEPRECATED: unreachable since #1226; discriminant reserved, must not be reused
     DeadlinePassed = 47,
     SlippageExceeded = 48,
     InvalidIndex = 49,
@@ -335,26 +344,47 @@ pub(crate) fn effective_max_tickets_per_address(raffle: &Raffle) -> Option<u32> 
     }
 }
 
-#[allow(dead_code)]
+/// Enforce the per-address ticket cap, returning the correct error for each
+/// case:
+///
+/// - [`Error::MultipleTicketsNotAllowed`] when `allow_multiple = false` and
+///   `max_tickets_per_address` is unset (0), meaning at most one ticket is
+///   permitted and the purchase would exceed it.
+/// - [`Error::ExceedsMaxTicketsPerAddress`] when an explicit
+///   `max_tickets_per_address` cap is set and the purchase would exceed it.
+///
+/// Returns `Ok(())` when no per-address cap applies or the purchase fits
+/// within the cap.
 pub(crate) fn enforce_max_tickets_per_address(
     env: &Env,
     raffle: &Raffle,
     address: &Address,
     quantity: u32,
 ) -> Result<(), Error> {
-    if let Some(cap) = effective_max_tickets_per_address(raffle) {
-        let current: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TicketCount(address.clone()))
-            .unwrap_or(0);
-        let Some(total) = current.checked_add(quantity) else {
-            return Err(Error::ExceedsMaxTicketsPerAddress);
-        };
-        if total > cap {
+    let current: u32 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::TicketCount(address.clone()))
+        .unwrap_or(0);
+
+    // `allow_multiple = false` with no explicit cap → at most one ticket.
+    if raffle.max_tickets_per_address == 0 && !raffle.allow_multiple {
+        if current > 0 || quantity > 1 {
+            return Err(Error::MultipleTicketsNotAllowed);
+        }
+        return Ok(());
+    }
+
+    // Explicit per-address cap.
+    if raffle.max_tickets_per_address > 0 {
+        let total = current
+            .checked_add(quantity)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if total > raffle.max_tickets_per_address {
             return Err(Error::ExceedsMaxTicketsPerAddress);
         }
     }
+
     Ok(())
 }
 
@@ -365,99 +395,41 @@ impl RaffleInstance {
         factory: Address,
         admin: Address,
         creator: Address,
-        config: RaffleConfig,
+        mut config: RaffleConfig,
     ) -> Result<(), Error> {
-        if config.description.len() > MAX_DESCRIPTION_LENGTH {
-            return Err(Error::InvalidParameters);
-        }
+        // Run the shared validator (same rules as the factory builder).
+        // This covers: description length, end_time, ticket limits,
+        // max_tickets_per_address normalisation, ticket_price, bundles,
+        // prize_amount, prizes bp-sum, protocol_fee_bp, oracle_address for
+        // External mode, metadata_hash, category, payment_token SAC check,
+        // resolve_defaults(), and claim/expiry/swap deadline ranges.
+        let instance_address = env.current_contract_address();
+        validate_config(&env, &mut config, Some(&instance_address)).map_err(|e| match e {
+            ConfigValidationError::InvalidParameters => Error::InvalidParameters,
+            ConfigValidationError::InvalidTicketRange => Error::InvalidTicketRange,
+            ConfigValidationError::InvalidEndTime => Error::InvalidEndTime,
+            ConfigValidationError::TooManyPrizes => Error::TooManyPrizes,
+            ConfigValidationError::InvalidTokenAddress => Error::InvalidTokenAddress,
+        })?;
 
-        let now = env.ledger().timestamp();
-        if config.no_deadline && config.end_time != 0 {
-            return Err(Error::InvalidParameters);
-        }
-        if !config.no_deadline && config.end_time <= now {
-            return Err(Error::InvalidParameters);
-        }
-        // Explicit check: end_time must be either 0 (no deadline) or in the future
-        if config.end_time != 0 && config.end_time <= now {
-            return Err(Error::InvalidEndTime);
-        }
-        if config.max_tickets == 0 || config.max_tickets > MAX_TICKETS_LIMIT {
-            return Err(Error::InvalidParameters);
-        }
-        if config.max_tickets < config.min_tickets {
-            return Err(Error::InvalidTicketRange);
-        }
-        if config.max_tickets_per_tx == 0 || config.max_tickets_per_tx > config.max_tickets {
-            return Err(Error::InvalidParameters);
-        }
-        if config.max_tickets_per_address > 0
-            && config.max_tickets_per_address > config.max_tickets
-        {
-            return Err(Error::InvalidParameters);
-        }
+        // Checks not yet covered by validate_config:
 
-        if config.ticket_price < MIN_TICKET_PRICE {
-            return Err(Error::InvalidParameters);
-        }
-        if config.prize_amount < config.ticket_price {
-            return Err(Error::InvalidParameters);
-        }
-        if config.prize_amount > MAX_PRIZE_AMOUNT {
-            return Err(Error::InvalidParameters);
-        }
+        // Reject if the prize amount would exceed the internal-randomness cap.
         if exceeds_internal_randomness_cap(&config.randomness_source, config.prize_amount) {
             return Err(Error::InvalidParameters);
         }
-        if config.prizes.is_empty() {
-            return Err(Error::InvalidParameters);
-        }
-        if config.prizes.len() > MAX_PRIZES {
-            return Err(Error::TooManyPrizes);
-        }
-        if config.prizes.len() > config.max_tickets {
-            return Err(Error::InvalidParameters);
-        }
-        let mut total_prizes_bp = 0u32;
-        for prize_bp in config.prizes.iter() {
-            if prize_bp > 10_000 {
-                return Err(Error::InvalidParameters);
-            }
-            total_prizes_bp = total_prizes_bp
-                .checked_add(prize_bp)
-                .ok_or(Error::InvalidParameters)?;
-        }
-        if total_prizes_bp != 10000 {
-            return Err(Error::InvalidParameters);
-        }
 
-        if config.protocol_fee_bp > 10000 {
-            return Err(Error::InvalidParameters);
-        }
-        if config.protocol_fee_bp > 0 && config.treasury_address.is_none() {
-            return Err(Error::InvalidParameters);
-        }
-
-if config.randomness_source == RandomnessSource::External {
-            match config.oracle_address {
-                None => return Err(Error::InvalidParameters),
-                Some(ref addr) if *addr == env.current_contract_address() => {
-                    return Err(Error::InvalidParameters);
-                }
-                Some(_) => {}
-            }
-        }
-
-        // Quorum validation: k must be > 0, oracles must be non-empty, and
-        // oracle_address must not be set (oracles are embedded in the enum).
-        if let RandomnessSource::Quorum(QuorumConfig { k, oracles }) = &config.randomness_source {
-            if *k == 0 || *k > oracles.len() as u32 {
+        // Quorum mode: validate k bounds, oracle count, self-address, and the
+        // absence of a conflicting single oracle_address field.
+        if let RandomnessSource::Quorum(QuorumConfig { k, ref oracles }) =
+            config.randomness_source.clone()
+        {
+            if k == 0 || k > oracles.len() as u32 {
                 return Err(Error::InvalidParameters);
             }
             if oracles.len() > 10 {
                 return Err(Error::InvalidParameters);
             }
-            // Self-check: none of the oracles may be the raffle contract itself.
             for i in 0..oracles.len() {
                 if let Some(addr) = oracles.get(i) {
                     if addr == env.current_contract_address() {
@@ -465,31 +437,12 @@ if config.randomness_source == RandomnessSource::External {
                     }
                 }
             }
-            // Quorum mode must not also set a single oracle_address.
             if config.oracle_address.is_some() {
                 return Err(Error::InvalidParameters);
             }
         }
 
-        if config.randomness_source != RandomnessSource::External
-            && config.randomness_source
-                != RandomnessSource::Quorum(QuorumConfig {
-                    k: 1,
-                    oracles: Vec::new(&env),
-                })
-            && config.oracle_address.is_some()
-        {
-            return Err(Error::InvalidParameters);
-        }
-
-        if config.metadata_hash == BytesN::from_array(&env, &[0u8; 32]) {
-            return Err(Error::InvalidParameters);
-        }
-
-        // Validate that the payment_token is a valid token contract
-        validate_token_address(&env, &config.payment_token)?;
-
-        // Honour the prize-token override if provided; otherwise default to payment_token.
+        // Validate prize-token override if provided; default to payment_token.
         if let Some(ref pt) = config.prize_token {
             validate_token_address(&env, pt)?;
         }
@@ -498,42 +451,10 @@ if config.randomness_source == RandomnessSource::External {
             .clone()
             .unwrap_or_else(|| config.payment_token.clone());
 
-        // Resolve default values for fields that use 0 as "use default"
-        let mut config = config.resolve_defaults();
-
-        // `allow_multiple = false` is the legacy spelling of a one-ticket cap.
-        // The explicit `max_tickets_per_address` cap supersedes it when set.
-        if !config.allow_multiple && config.max_tickets_per_address == 0 {
-            config.max_tickets_per_address = 1;
-        }
-
-        // #259: claim_lockup_seconds must be within [0, MAX_CLAIM_LOCKUP_SECONDS].
+        // After validate_config has run resolve_defaults(), read the resolved values.
         let claim_lockup = config.claim_lockup_seconds.unwrap_or(DEFAULT_CLAIM_LOCKUP_SECONDS);
-        if claim_lockup > MAX_CLAIM_LOCKUP_SECONDS {
-            return Err(Error::InvalidParameters);
-        }
-
         let claim_expiry = config.claim_expiry_seconds.unwrap_or(DEFAULT_CLAIM_EXPIRY_SECONDS);
-        if claim_expiry < MIN_CLAIM_EXPIRY_SECONDS {
-            return Err(Error::InvalidParameters);
-        }
-        if claim_expiry <= claim_lockup {
-            return Err(Error::InvalidParameters);
-        }
-
-        // Swap deadline must be within [0, MAX_SWAP_DEADLINE_SECONDS].
         let swap_deadline = config.swap_deadline_seconds.unwrap_or(DEFAULT_SWAP_DEADLINE_SECONDS);
-        if swap_deadline > MAX_SWAP_DEADLINE_SECONDS {
-            return Err(Error::InvalidParameters);
-        }
-
-        // Validate early bird parameters
-        if config.early_bird_ticket_percentage > 100 {
-            return Err(Error::InvalidParameters);
-        }
-        if config.early_bird_ticket_percentage > 0 && config.early_bird_discount_bp > 10000 {
-            return Err(Error::InvalidParameters);
-        }
 
         let raffle = Raffle {
             creator: creator.clone(),
@@ -555,12 +476,12 @@ if config.randomness_source == RandomnessSource::External {
             prize_deposited: false,
             winners: Vec::new(&env),
             randomness_source: config.randomness_source.clone(),
-            oracle_address: config.oracle_address,
-            oracle_public_key: config.oracle_public_key,
+            oracle_address: config.oracle_address.clone(),
+            oracle_public_key: config.oracle_public_key.clone(),
             protocol_fee_bp: config.protocol_fee_bp,
-            treasury_address: config.treasury_address,
-            swap_router: config.swap_router,
-            tikka_token: config.tikka_token,
+            treasury_address: config.treasury_address.clone(),
+            swap_router: config.swap_router.clone(),
+            tikka_token: config.tikka_token.clone(),
             finalized_at: None,
             claim_lockup_seconds: claim_lockup,
             claim_expiry_seconds: claim_expiry,
@@ -573,6 +494,7 @@ if config.randomness_source == RandomnessSource::External {
             bundles: config.bundles.clone(),
             nft_contract: config.nft_contract.clone(),
         };
+
         // Config validation above runs first so that a re-init with an
         // invalid config reports the actual config error rather than
         // `AlreadyInitialized`.

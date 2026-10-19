@@ -11,7 +11,7 @@ use crate::events::{
 };
 use crate::{
     calculate_tier_prize, read_raffle, require_admin, write_raffle, DataKey, Error, RaffleStatus,
-    transition_status, EMERGENCY_WITHDRAW_DELAY_SECONDS, MAX_PROTOCOL_FEE_BP,
+    apply_status_transition, EMERGENCY_WITHDRAW_DELAY_SECONDS, MAX_PROTOCOL_FEE_BP,
     MAX_SWAP_DEADLINE_SECONDS,
 };
 
@@ -234,12 +234,13 @@ pub(crate) fn cancel_raffle(env: Env, reason: CancelReason) -> Result<(), Error>
     {
         return Err(Error::InvalidStatus);
     }
-    transition_status(
+    apply_status_transition(
         &env,
         &mut raffle,
         RaffleStatus::Cancelled,
         env.ledger().timestamp(),
     )?;
+    write_raffle(&env, &raffle);
     RaffleCancelled {
         creator: raffle.creator.clone(),
         reason,
@@ -276,12 +277,13 @@ pub(crate) fn execute_admin_cancel(env: Env) -> Result<(), Error> {
     }
     
     // Execute the cancel
-    transition_status(
+    apply_status_transition(
         &env,
         &mut raffle,
         RaffleStatus::Cancelled,
         now,
     )?;
+    write_raffle(&env, &raffle);
     
     // Clear the pending cancel
     env.storage().instance().remove(&DataKey::PendingAdminCancel);
@@ -710,12 +712,13 @@ pub(crate) fn emergency_withdraw(env: Env, caller: Address) -> Result<(), Error>
     }
 
     raffle.prize_deposited = false;
-    transition_status(
+    apply_status_transition(
         &env,
         &mut raffle,
         RaffleStatus::Cancelled,
         env.ledger().timestamp(),
     )?;
+    write_raffle(&env, &raffle);
 
     let tc = token::Client::new(&env, &prize_token);
     tc.transfer(
